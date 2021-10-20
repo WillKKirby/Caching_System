@@ -1,0 +1,294 @@
+-------------------------------------------------------------------------------------------------------
+-- Company: University Of York                                                                       --
+-- Engineer: Will Kirby                                                                              --
+-- Module Name: IMMU_unit                                                                            --
+-- Project Name: Cache Implementation for the Simple MOVE Processor                                  --
+-- Tool versions: Vivado 2017.4                                                                      --
+-- Description: Fully Assosative Instruction Cache Unit.                                             --
+-------------------------------------------------------------------------------------------------------
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.DigEng.all;
+
+entity IMMU is
+generic ( instr_size    : integer := 32;
+          data_size     : integer := 32;
+          block_size    : integer := 16;
+          num_blocks    : integer := 2;
+          G_M           : integer := 8 -- Must be between 2 and 19 
+         );
+port (
+    clk : in std_logic;
+    rst : in std_logic;
+    en : in std_logic;
+
+    -- Ports from Fetch Unit 
+    instr_address    : in std_logic_vector(instr_size - 1 downto 0);  -- Address from Fetch Unit 
+    instr_data : out std_logic_vector(instr_size - 1     downto 0); -- Instr data to be sent back to Fetch unit
+    instr_rdy  : out std_logic;                                    -- signal for hits and misses
+    instr_request : in std_logic;                                  -- signal for instruction request
+    
+    -- Ports for Aubritation
+    sysBus_grant_in  : in    std_logic;   -- sysBus grant chain in 
+    sysBus_grant_out : out   std_logic;   -- sysBus grant chain out
+    sysBus_request   : out   std_logic;   -- sysBus request line   
+    sysBus_busy      : out   std_logic;   -- sysBus busy line
+    
+    -- Ports for System bus 
+    sysBus_data      : in    std_logic_vector(data_size - 1 downto 0);    -- sysBus data connection, for instrctions only need in
+    sysBus_address   : out   std_logic_vector(instr_size - 1 downto 0);   -- sysBus address output
+    sysBus_control   : out   std_logic_vector(1 downto 0)                -- Control signal for sysBus
+    
+    -- Counter value for block transfew
+    --counter_val : in std_logic_vector(log2(block_size)-1 downto 0)
+    );
+end IMMU;
+
+architecture Behavioral of IMMU is
+
+-- Constants for the Unit. Used for when the counter is used as a random gen.
+-- This value is used to increace the counter limit, so the slice of value sampled is more random. 
+constant block_addition_value : integer := 10;
+
+-- This is an array of polynomials used for the LFSR "random" number generator. 
+-- These values were used from this webiste, "https://surf-vhdl.com/how-to-implement-an-lfsr-in-vhdl/"
+type Poly_Array is array (19 downto 2) of std_logic_vector(18 downto 0); 
+constant P_Array : Poly_Array := ("1110010000000000000", "0100000010000000000", "0010010000000000000",
+                                  "0001011010000000000", "0000110000000000000", "0000011100000000010",
+                                  "0000001110010000000", "0000000111000001000", "0000000010100000000",
+                                  "0000000001001000000", "0000000000100010000", "0000000000010111000",
+                                  "0000000000001100000", "0000000000000110000", "0000000000000010100",
+                                  "0000000000000001100", "0000000000000000110", "0000000000000000011" );
+
+-------------------
+-- Internal Signals
+-------------------
+
+-- Internal signals for FSM
+type fsm_states is (idle, request, read_1, read_2, read_3, pass_state);
+signal state, next_state : fsm_states;
+
+-- Internal signals for the sysBus
+signal sysBus_address_int : std_logic_vector (data_size - 1 downto 0);
+signal sysBus_data_int : std_logic_vector (data_size - 1 downto 0);
+signal sysBus_request_int : std_logic;
+
+-- Signals for the counter.
+signal counter_en : std_logic;
+signal counter_val_int : unsigned(log2(block_size)-1 downto 0);
+signal busy : std_logic;
+
+-- Signals for block placment counter.
+signal block_counter_en : std_logic;
+signal block_counter_val_int : unsigned(log2((num_blocks+block_addition_value))-1 downto 0);
+
+-- Tag compare signal
+signal Hit : std_logic;
+signal Miss : std_logic;
+
+-- Signals for the address components
+signal Address_Tag : std_logic_vector(instr_size-log2(block_size)-1 downto 0);
+signal Address_Block_Ofset : std_logic_vector(block_size-1 downto 0);
+
+-- Block address for the RAMS
+signal block_Address : unsigned(log2(num_blocks)-1 downto 0);
+
+-- Signals for the cache mem 
+signal wen : std_logic;
+signal Waddress, Raddress : unsigned(log2(block_size)-1 downto 0);
+signal instr_in, instr_out : std_logic_vector(instr_size-1 downto 0);
+
+-- Block Index ram signals (Note, BI = Block Index)
+signal Tag_we, Tag_re : std_logic;
+signal Tag_waddress, Tag_raddress : std_logic_vector(log2(num_blocks)-1 downto 0);
+signal Tag_in, Tag_out : std_logic_vector(instr_size-log2(block_size)-1 downto 0);
+
+-- This is the address for placing blocks when there is a miss, in the associated memory.
+signal placment_address : unsigned(log2(num_blocks)-1 downto 0);
+
+signal sync_reset : std_logic;
+signal seed : std_logic_vector(G_M-1 downto 0);
+signal lfsr_en : std_logic;
+signal Output_lfsr : std_logic_vector(G_M-1 downto 0);
+signal lfsr_rst : std_logic;
+
+begin
+
+-- Process for moving states and resets 
+state_assignment : process(clk) is
+begin
+    if rising_edge(clk) then
+        if(rst = '1') then
+            state <= idle;
+        else
+            state <= next_state;
+        end if;
+    end if;
+end process state_assignment;
+
+-- Next state logic 
+
+next_state_assignment : process(state, instr_request, sysBus_grant_in, Miss, counter_val_int)
+-- Need logic for state for inital moving to request state
+begin
+    case state is
+        when idle => 
+            if (instr_request = '1' and Miss = '1') then
+                next_state <= request;
+            else
+                next_state <= state;
+            end if;
+        when request =>
+			if (sysBus_grant_in = '1') then
+				next_state <= read_1;
+			else 
+				next_state <= state;
+			end if;
+			
+	    when read_1 =>
+               next_state <= read_2;
+               
+        when read_2 =>
+           next_state <= read_3;
+           
+        when read_3 =>
+            if (counter_val_int) = block_size-1 then
+				next_state <= pass_state;
+			else 
+				next_state <= state;
+			end if;
+			
+        when pass_state =>
+                next_state <= idle;
+                
+    end case;
+end process next_state_assignment;
+
+------------------------
+-- Genral Use Counter -- 
+------------------------
+ 
+address_counter : entity work.address_counter_new
+generic map( limit => block_size )
+port map ( clk => clk,
+         rst => rst,
+         en => counter_en,
+         c_out => counter_val_int );
+         
+-- Counter Signals.
+counter_en <= '1' when state = read_3 else '0';   
+
+----------------------------
+-- Block Placment counter -- 
+----------------------------
+ 
+-- Counter used for generateing addresses for the block placment. 
+-- In an aim for it to be random the counter will run constantly and and hopfully be sampled the same way. 
+-- This can be used by uncommenting the counter code, enable signal and placment_address
+--   Then, commenting out the other statment for the placement address. 
+ 
+--Block_Placment : entity work.address_counter_new
+--generic map( limit => (num_blocks+block_addition_value) ) -- The max number needs to be larger than the needed amount. 
+--port map ( clk => clk,
+--           rst => rst,
+--           en => block_counter_en,
+--           c_out => block_counter_val_int ); 
+         
+------ Counter Signals.
+--block_counter_en <= not busy;
+--placment_address <= block_counter_val_int(log2(num_blocks)-1 downto 0) when state = read_1 else (others => 'U');
+
+---------------------------------------------------
+-- Signals for the address and instr_rdy signals -- 
+---------------------------------------------------
+
+-- Splitting up the address
+Address_Tag <= instr_address(instr_size-1 downto log2(block_size));
+Address_Block_Ofset <= instr_address(block_size-1 downto 0);
+
+-- Signal the instruction is ready if it is here 
+instr_rdy <= '1' when Hit = '1' and state = idle else '0';
+       
+------------------
+-- SysBus Logic -- 
+------------------
+
+-- Signal for when the cache is in a busy state. 
+busy <= '1' when state = read_1 or state = read_2 or state = read_3 else '0';
+-- System bus Request signals --
+sysBus_request_int <= '1' when state = request else '0';
+sysBus_request <= sysBus_request_int when state = request else 'Z';
+-- Busy line 
+sysBus_busy <= '1' when busy = '1' else 'Z'; 
+-- system bus control signal - Set to "01" we only need to block read
+sysBus_control <= "01" when busy = '1' else (others => 'Z');
+-- Address
+sysBus_address <= instr_address when busy = '1' else (others => 'Z');
+-- Grant Out
+sysBus_grant_out <= sysBus_grant_in and (not sysBus_request_int);
+
+------------------------------------------
+--              Tag RAM                 --
+------------------------------------------
+
+Tag_RAM : entity work.assositive_mem
+Generic Map ( block_size => block_size,
+              num_blocks => num_blocks,
+              data_size => instr_size)
+Port Map    ( clk => clk,
+              rst => rst,
+              block_select => placment_address,
+              Tag_In => Address_Tag,
+              Hit => Hit,
+              Block_Address => Block_Address );
+
+placment_address <= unsigned(Output_lfsr(log2(num_blocks)-1 downto 0)) when state = read_1 else (others => 'U');
+Miss <= not Hit;
+
+-------------------
+-- RAM for Cache --
+-------------------
+
+instr_mem : entity work.cache_mem
+Generic map (  block_size => block_size,
+              instr_size => instr_size,
+              num_blocks => num_blocks )
+Port map    ( clk => clk,
+              wen => wen,
+              block_address => (block_Address),
+              Waddress => unsigned(counter_val_int),
+              Raddress => Raddress,
+              instr_in => sysBus_data,
+              instr_out => instr_out );
+              
+-- Will read all the data coming in while in read state               
+wen <= '1' when state = read_3 else '0';              
+-- In this case fetch the data from the RAM
+Raddress <= unsigned(instr_address(log2(block_size)-1 downto 0)) when Hit = '1';
+-- Push the instruction back to the fetch unit
+instr_data <= instr_out when Hit = '1';
+
+----------------------------------------------------             
+-- Linar Feedback Shift Register (LFSR) Component --
+----------------------------------------------------
+
+LFSR_Comp : entity work.lfsr
+generic map (G_M => G_M,
+             G_POLY => P_Array(G_M)(G_M-1 downto 0) )
+Port Map ( i_clk  => clk,
+           i_rstb => lfsr_rst,
+           i_sync_reset => sync_reset,
+           i_seed => P_Array(G_M)(G_M-1 downto 0),
+           i_en => lfsr_en,
+           o_lsfr => Output_lfsr );
+-- Signals for the working of the LFSR.
+-- The reset is active low, so the inverse of the systems reset. 
+lfsr_rst <= not rst;
+-- This signal, when High, allows a seed to be inputted into the LFSR.
+sync_reset <= '0';
+-- The LFSR enable signal.
+lfsr_en <= en;
+
+end Behavioral;
