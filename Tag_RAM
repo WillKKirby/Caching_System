@@ -1,0 +1,56 @@
+-------------------------------------------------------------------------------------------------------
+-- Company: University Of York                                                                       --
+-- Engineer: Will Kirby                                                                              --
+-- Module Name: Tag_RAM                                                                              --
+-- Project Name: Cache Implementation for the Simple MOVE Processor                                  --
+-- Tool versions: Vivado 2017.4                                                                      --
+-- Description: RAM that holds multiple RAM units and ammends block addresses                        --
+-------------------------------------------------------------------------------------------------------
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.DigEng.all;
+
+entity Tag_RAM is
+Generic (num_blocks : integer := 1;
+         block_size : integer := 16;
+         data_size : integer := 32 );
+Port ( clk : in std_logic;
+       wen : in std_logic;
+       Waddress : in unsigned(log2(num_blocks)-1 downto 0);
+       Raddress : in unsigned(log2(num_blocks)-1 downto 0);
+       Data_in : in std_logic_vector(data_size-1-log2(block_size) downto 0);
+       Data_out : out std_logic_vector(data_size-1-log2(block_size) downto 0) );
+
+end Tag_RAM;
+
+architecture Behavioral of Tag_RAM is
+
+-- Array for the Tags for each block in the cache.
+type RAM_Array is array (0 to num_blocks-1) of std_logic_vector(data_size-log2(block_size)-1 downto 0);
+signal ram : RAM_ARRAY ;
+
+-- Internal signal for the write address.
+signal waddress_int : unsigned(log2(num_blocks)-1 downto 0);
+
+begin
+    -- Directing the output, with catch statment for odd numbers of blocks.
+    Data_out <= ram(to_integer(Raddress)) when to_integer(Raddress) < num_blocks else
+                ram(to_integer(Raddress)-1) when to_integer(Raddress) = num_blocks;
+    
+    -- Directing the right address, with catch for odd numbers of blocks.
+    waddress_int <= waddress   when to_integer(waddress) < num_blocks else
+                    waddress-1 when to_integer(waddress) = num_blocks;
+    
+    -- Write process.
+    write : process (clk) is
+    begin
+        if rising_edge(clk) then
+            if wen = '1' then
+                ram(to_integer(waddress_int)) <= Data_in;
+            end if;
+        end if;
+    end process write;
+
+end Behavioral;
