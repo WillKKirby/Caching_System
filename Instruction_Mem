@@ -1,0 +1,51 @@
+-------------------------------------------------------------------------------------------------------
+-- Company: University Of York                                                                       --
+-- Engineer: Will Kirby                                                                              --
+-- Module Name: Cache_mem                                                                            --
+-- Project Name: Cache Implementation for the Simple MOVE Processor                                  --
+-- Tool versions: Vivado 2017.4                                                                      --
+-- Description: Cache memory unit, with parametizable block sizes and number of blocks.              --
+-------------------------------------------------------------------------------------------------------
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.DigEng.all;
+
+entity cache_mem is
+Generic ( block_size : integer := 16;
+          instr_size : integer := 32;
+          num_blocks : integer := 1
+         );
+Port ( 
+    clk : in std_logic;
+    wen : in std_logic;
+    block_address : in unsigned(log2(num_blocks)-1 downto 0);
+    Waddress : in unsigned(log2(block_size)-1 downto 0);
+    Raddress : in unsigned(log2(block_size)-1 downto 0);
+    instr_in : in std_logic_vector(instr_size-1 downto 0);
+    instr_out : out std_logic_vector(instr_size-1 downto 0)
+    );
+end cache_mem;
+
+architecture Behavioral of cache_mem is
+
+-- Generate the number of blocks and the right size of block.
+type ram_blocks is array (0 to block_size-1) of std_logic_vector(instr_size-1 downto 0);
+type ram_main is array (0 to num_blocks-1) of ram_blocks;
+signal ram : ram_main;
+
+begin
+    -- Asyncrous Read 
+    instr_out <= ram(to_integer(block_address))(to_integer(Raddress));
+    -- Small Process for writing to the RAM.
+    write : process (clk) is
+    begin
+        if rising_edge(clk) then
+            if wen = '1' then
+                ram(to_integer(block_address))(to_integer(Waddress)) <= instr_in;
+            end if;
+        end if;
+    end process write;
+
+end Behavioral;
