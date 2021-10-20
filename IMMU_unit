@@ -1,0 +1,234 @@
+-------------------------------------------------------------------------------------------------------
+-- Company: University Of York                                                                       --
+-- Engineer: Will Kirby                                                                              --
+-- Module Name: IMMU_unit                                                                            --
+-- Project Name: Cache Implementation for the Simple MOVE Processor                                  --
+-- Tool versions: Vivado 2017.4                                                                      --
+-- Description: Direct Mapped Instruction Cache Unit.                                                --
+-------------------------------------------------------------------------------------------------------
+
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.DigEng.all;
+
+entity IMMU is
+generic ( instr_size    : integer := 32;
+          data_size     : integer := 32;
+          block_size    : integer := 16;
+          num_blocks    : integer := 2
+         );
+port (
+    clk : in std_logic;
+    rst : in std_logic;
+    en : in std_logic;
+
+    -- Ports from Fetch Unit 
+    instr_address    : in std_logic_vector(instr_size - 1 downto 0);  -- Address from Fetch Unit 
+    instr_data : out std_logic_vector(instr_size - 1     downto 0); -- Instr data to be sent back to Fetch unit
+    instr_rdy  : out std_logic;                                    -- signal for hits and misses
+    instr_request : in std_logic;                                  -- signal for instruction request
+    
+    -- Ports for Aubritation
+    sysBus_grant_in  : in    std_logic;   -- sysBus grant chain in 
+    sysBus_grant_out : out   std_logic;   -- sysBus grant chain out
+    sysBus_request   : out   std_logic;   -- sysBus request line   
+    sysBus_busy      : out   std_logic;   -- sysBus busy line
+    
+    -- Ports for System bus 
+    sysBus_data      : in    std_logic_vector(data_size - 1 downto 0);    -- sysBus data connection, for instrctions only need in
+    sysBus_address   : out   std_logic_vector(instr_size - 1 downto 0);   -- sysBus address output
+    sysBus_control   : out   std_logic_vector(1 downto 0)                -- Control signal for sysBus
+    
+    );
+end IMMU;
+
+architecture Behavioral of IMMU is
+
+-------------------
+-- Internal Signals
+-------------------
+
+-- Internal signals for FSM
+type fsm_states is (idle, request, read_1, read_2, read_3, pass_state);
+signal state, next_state : fsm_states;
+
+-- Internal signals for the sysBus
+signal sysBus_address_int : std_logic_vector (data_size - 1 downto 0);
+signal sysBus_data_int : std_logic_vector (data_size - 1 downto 0);
+signal sysBus_request_int : std_logic;
+
+-- Signals for the counter.
+signal counter_en : std_logic;
+signal counter_val_int : unsigned(log2(block_size)-1 downto 0);
+signal busy : std_logic;
+
+-- Signals for the cache mem 
+signal wen : std_logic;
+signal Waddress, Raddress : unsigned(log2(block_size)-1 downto 0);
+signal instr_in, instr_out : std_logic_vector(instr_size-1 downto 0);
+
+-- Tag compare signal
+signal Hit : std_logic;
+signal Miss : std_logic;
+
+-- Block Index ram signals (Note, BI = Block Index)
+signal Tag_we, Tag_re : std_logic;
+signal Tag_waddress, Tag_raddress : std_logic_vector(log2(num_blocks)-1 downto 0);
+signal Tag_in, Tag_out : std_logic_vector(instr_size-log2(block_size)-1 downto 0);
+
+begin
+
+-- Process for moving states and resets.
+
+state_assignment : process(clk) is
+begin
+    if rising_edge(clk) then
+        if(rst = '1') then
+            state <= idle;
+        else
+            state <= next_state;
+        end if;
+    end if;
+end process state_assignment;
+
+-- Next state logic.
+
+next_state_assignment : process(state, instr_request, sysBus_grant_in, Miss, counter_val_int)
+
+begin
+    case state is
+    
+        when idle => 
+            if (instr_request = '1' and Miss = '1') then
+                next_state <= request;
+            else
+                next_state <= state;
+            end if;
+            
+        when request =>
+			if (sysBus_grant_in = '1') then
+				next_state <= read_1;
+			else 
+				next_state <= state;
+			end if;
+			
+	    when read_1 =>
+               next_state <= read_2;
+               
+        when read_2 =>
+           next_state <= read_3;
+           
+        when read_3 =>
+            if (counter_val_int) = block_size-1 then
+				next_state <= pass_state;
+			else 
+				next_state <= state;
+			end if;
+			
+        when pass_state =>
+                next_state <= idle;
+                
+    end case;
+end process next_state_assignment;
+
+------------------------------
+-- Logic for FSM --
+------------------------------
+
+-- Check Hit / Miss -- 
+-- Compare the Tag and the incoming address
+Hit <= '1' when instr_address(instr_size-1 downto log2(block_size)) = Tag_out and state = idle else '0';
+Miss <= not Hit;
+
+-- Hit related activity.
+-- Signal the instruction is ready if it is here 
+instr_rdy <= '1' when Hit = '1' else '0';
+-- In this case fetch the data from the RAM
+Raddress <= unsigned(instr_address(log2(block_size)-1 downto 0)) when Hit = '1';
+-- Push the instruction back to the fetch unit
+instr_data <= instr_out when Hit = '1';
+
+------------------
+-- SysBus Logic -- 
+------------------
+
+-- When the IMMU is in a read state
+busy <= '1' when state = read_1 or state = read_2 or state = read_3 else '0';
+-- Request signals.
+sysBus_request_int <= '1' when state = request else '0';
+sysBus_request <= sysBus_request_int when state = request else 'Z';
+-- Busy line.
+sysBus_busy <= '1' when busy = '1' else 'Z'; 
+-- system bus control signal - Set to "01" we only need to block read.
+sysBus_control <= "01" when busy = '1' else "ZZ";
+-- Address.
+sysBus_address <= instr_address when busy = '1' else (others => 'Z');
+-- Grant Out.
+sysBus_grant_out <= sysBus_grant_in and (not sysBus_request_int);
+
+------------------------------------------
+-- RAM for the TAG of the instructions--
+------------------------------------------
+
+-- RAM Exchange 
+Tag_RAM : entity work.Tag_RAM
+Generic Map (block_size => block_size,
+             num_blocks => num_blocks,
+             data_size => instr_size)
+Port Map ( clk => clk,
+           wen => Tag_we,
+           Waddress => unsigned(Tag_waddress),
+           Raddress => unsigned(Tag_raddress),
+           Data_in => Tag_in,
+           Data_out => Tag_out  );
+
+-- Tag RAM Control & I/O Signals --
+-- Write Enable when the counter = 1.
+Tag_we <= '1' when unsigned(counter_val_int) = 1 else '0';
+-- The read and write addresses are always the same, which is the block address,
+--  within the requested address.
+Tag_waddress <= instr_address(log2(block_size)+log2(num_blocks)-1 downto log2(block_size));
+Tag_raddress <= instr_address(log2(block_size)+log2(num_blocks)-1 downto log2(block_size));
+-- Tag in is the Tag section of the requested address.
+Tag_in <= instr_address(instr_size-1 downto log2(block_size));
+                            
+-------------------
+-- RAM for Cache --
+-------------------
+-- RAM that holds the instructions.
+
+instr_mem : entity work.cache_mem
+Generic map (
+              block_size => block_size,
+              instr_size => instr_size,
+              num_blocks => num_blocks )
+Port map    ( 
+              clk => clk,
+              wen => wen,
+              block_address => unsigned(Tag_waddress),
+              Waddress => unsigned(counter_val_int),
+              Raddress => Raddress,
+              instr_in => sysBus_data,
+              instr_out => instr_out );
+              
+-- Will read all the data coming in while in read state 
+wen <= '1' when state = read_3 else '0';
+
+-------------
+-- Counter -- 
+-------------
+-- Used for the placment addresses for the block reads.
+            
+address_counter : entity work.address_counter_new 
+generic map( limit => block_size )
+port map ( clk => clk,
+         rst => rst,
+         en => counter_en,
+         c_out => counter_val_int );
+
+-- Counter Enable signal.
+counter_en <= '1' when state = read_3 else '0';  
+
+end Behavioral;
