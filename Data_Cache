@@ -1,0 +1,673 @@
+-------------------------------------------------------------------------------------------------------
+-- Company: University Of York                                                                       --
+-- Engineer: Will Kirby, based on works by Jonathan Procter.                                         --
+-- Module Name: Memory_subsystem_unit                                                                --
+-- Project Name: Cache Implementation for the Simple MOVE Processor,                                 --
+--   Based on the project, Memory Subsystems for the Simple MOVE Processor                           --
+-- Tool versions: Vivado 2017.4                                                                      --
+-- Description: Basic MMU and data-cache to allow memory access to the the FU bus.                   --
+--                                                                                                   --
+-- Input/Output Registers:                                                                           --
+-- 0 - read_address: input, used to specify an address to read data from, writing to triggers a read --
+-- 1 - write_address: input, used to specify an address to write data to                             --
+-- 2 - dataIn: input, data to be written to write_address.                                           --
+-- 3 - dataOut: output, data that has been read from read_address.                                   --
+                                                                                                     --
+-------------------------------------------------------------------------------------------------------
+
+library IEEE;
+library UNISIM;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use UNISIM.VComponents.ALL;
+use work.DigEng.all;
+
+entity Memory_subsystem_unit is
+    generic(data_size  : INTEGER := 32; -- Size of data. 
+            block_size : integer := 16; -- Size of blocks of data from the main-memory. 
+            num_blocks : integer := 2;  -- Number of blocks in the data cache.
+            num_in_reg : INTEGER := 3;  -- Number of input registers.
+            num_reg    : INTEGER := 4;  -- Number of total registers.
+            mem_range_start : integer := 16#00000000#; -- Range of addresses for the main memory.
+            mem_range_end : integer := 16#00FFFFFF#;
+            write_through : integer := 0 -- Flag for enableing the write-back method to the memory.
+            );                  
+    port(clk              : in    STD_LOGIC;                                -- Clock.
+         rst              : in    STD_LOGIC;                                -- Reset.
+         en_all           : in    STD_LOGIC;                                -- Enable for all sequential elements.
+         reg_input        : in    STD_LOGIC_VECTOR(data_size - 1 downto 0); -- Data input to FU.
+         reg_output       : OUT   STD_LOGIC_VECTOR(data_size - 1 downto 0); -- Data output from FU.
+         we_regs          : in    STD_LOGIC_VECTOR(num_reg   - 1 downto 0); -- Registers write enable. 
+         re_regs          : in    STD_LOGIC_VECTOR(num_reg   - 1 downto 0); -- Registers read enable.
+         scan_mode_en     : in    STD_LOGIC;                                -- Switches the unit to scan mode.
+         scan_input_bus   : in    STD_LOGIC_VECTOR(data_size     downto 0); -- Input of the scan chain. 
+         scan_output_bus  : OUT   STD_LOGIC_VECTOR(data_size     downto 0); -- Output of the scan chain.
+         sysBus_data      : INOUT STD_LOGIC_VECTOR(data_size - 1 downto 0); -- sysBus data connection.
+         sysBus_address   : OUT   STD_LOGIC_VECTOR(data_size - 1 downto 0); -- sysBus address output.
+         sysBus_control   : OUT   std_logic_vector(1 downto 0);             -- Control signal(s) for the sysBus (write en).
+         sysBus_grant_in  : in    STD_LOGIC;                                -- sysBus grant chain in. 
+         sysBus_grant_out : OUT   STD_LOGIC;                                -- sysBus grant chain out.
+         sysBus_request   : OUT   STD_LOGIC;                                -- sysBus request line.  
+         sysBus_busy      : OUT   STD_LOGIC;                                -- sysBus busy line.
+         pause_line       : out   STD_LOGIC );                              -- signal to pause the fetch unit.
+end Memory_subsystem_unit;
+
+architecture Behavioral of Memory_subsystem_unit is
+
+    ----------------------
+    -- Internal signals --
+    ----------------------
+    
+    -- States for the FSM.
+    type fsm_states is (idle, Miss_Request, Write_through_request, write_back_request, Buffer_block_placment, write_through_state_1, write_through_state_2,
+      write_back_state_1, busy_1, busy_2, busy_3, pass_state,  Non_mem_request, non_mem_busy_1, non_mem_busy_2, write_back_state_2, pass_back_state, buffer_block_switch);
+    -- Signals for the FSM.
+    signal state, next_state : fsm_states;
+        
+    -- Array for outputs from registers.
+    type bus_array is array (num_reg - 1 downto 0) OF STD_LOGIC_VECTOR(data_size - 1 downto 0);
+    signal reg_out : bus_array; 
+    
+    -- Array for results to be put into output registers.
+    type bus_array2 is array (num_reg - 1 downto num_in_reg) OF UNSIGNED(data_size - 1 downto 0);
+    signal result : bus_array2;
+    
+    -- Enable signals for input registers.
+    type reg_en is array (num_in_reg - 1 downto 0) OF STD_LOGIC;
+    signal in_reg_en : reg_en;
+    
+    -- Enable signals for output registers.
+    type reg_en2 is array (num_reg - 1 downto num_in_reg) OF STD_LOGIC;
+    signal out_reg_en : reg_en2;
+    
+    -- Scan cell ID interconnections.
+    type cell_ID is array (num_reg - 1 downto 0) OF STD_LOGIC;
+    signal cell_ID_out : cell_ID;
+
+    -- Trigger signals for the registers.
+    signal trig_read_address, trig_write_address : STD_LOGIC;
+	
+	-- Internal signals for system bus negotiation.
+    signal sysBus_request_internal : STD_LOGIC;
+    signal sysBus_control_internal : std_logic_vector(1 downto 0);
+
+    -- Cahce Hit and Miss signals.
+    signal Hit, Miss : std_logic;
+    -- Internal Signal to pause the processor when waiting for the mem to work.
+    signal pause_line_int : std_logic;
+    -- Signal indicating the inputted address needs the cache/memory, instead of another peripheral.
+    -- Goes high when the requested address is within the addressable main-memory range.
+    signal Require_Main_mem : std_logic;	
+
+    -- This array will keep a bit to determine if the block in cache has been modified.
+    type block_bit is array (num_blocks-1 downto 0) of std_logic;
+    signal Modified_block : block_bit;
+    -- This bit stores weather the block in the buffer has been modified.
+    signal Buffer_modified_bit : std_logic;
+    -- This signal is a tempory signal which aids in switching of the modified bit when the block in the buffer switches.
+    signal buffer_modified_bit_temp : std_logic;
+    -- This signal goes high when the requested block is in the block buffer.
+    signal Block_in_buffer : std_logic;
+    
+    -- Signals for the data cache RAMS. -- 
+    
+    -- The main data RAM for the cache.
+    signal Cache_wen : std_logic;
+    signal Cache_Waddress, Cache_Raddress : unsigned(log2(block_size)-1 downto 0);
+    signal cache_data_in, cache_data_out : std_logic_vector(data_size-1 downto 0);
+    
+    -- The main Tag RAM for the cache.
+    signal Tag_wen : std_logic;
+    signal Tag_Raddress, Tag_Waddress : unsigned(log2(num_blocks)-1 downto 0);
+    signal Tag_in, Tag_out : std_logic_vector(data_size-1-log2(block_size) downto 0);
+    
+    -- The tempory block buffer RAM.
+    signal Block_buffer_wen : std_logic;
+    signal Block_buffer_Waddress, Block_buffer_Raddress : unsigned(log2(block_size)-1 downto 0);
+    signal Block_buffer_in, Block_buffer_out : std_logic_vector(data_size-1 downto 0);	
+	
+    -- The tempory RAM buffer RAM.
+    signal Tag_buffer_wen : std_logic;
+    signal Tag_buffer_Waddress, Tag_buffer_Raddress : unsigned(0 downto 0);
+    signal Tag_buffer_in, Tag_buffer_out : std_logic_vector(data_size-log2(block_size)-1 downto 0);	
+
+    -- Counter used for the block transfers and block write-backs.
+    signal counter_rst, counter_en : std_logic;
+    signal counter_out : unsigned(log2(block_size)-1 downto 0);
+    
+    -- Block address. The address where the blocks are to be placed.
+    signal block_address_temp : unsigned(log2(num_blocks)-1 downto 0);
+    signal block_address : unsigned(log2(num_blocks)-1 downto 0);
+    
+    -- Busy signal. These signals are to aid in making the logic more tidy. 
+    signal Busy_sig : std_logic;
+    signal write_back_busy : std_logic;
+    
+    -- Block right back signal. 
+    -- This goes high when the block in the buffer RAM needs to be written back to the main memory.
+    signal block_write_back : std_logic;
+    
+    -- Write through Trigger. Triggers when there is a write and write through is enabled. 
+    signal write_through_trig : std_logic;
+    
+    -- Non mem operation bit.
+    signal non_mem_operation : std_logic;
+
+begin
+
+---------------------------------------------------
+-- Logic to geneate enable signals for registers --
+---------------------------------------------------
+
+-- Generate enable signals for input registers.
+input_regs_en : for H in 0 to num_in_reg - 1 generate
+in_reg_en(H) <= (we_regs(H) and en_all) or (scan_mode_en and en_all);
+end generate;
+
+-- Generate enable signals for output registers.           
+output_regs_en : for I in num_in_reg to num_reg-1 generate
+out_reg_en(I) <= (re_regs(I) and en_all) or (scan_mode_en and en_all);
+end generate;
+
+----------------------------------------------------
+-- Triggering from different register read/writes --
+----------------------------------------------------
+
+-- DFFs used to delay the triggering signal by a clock cycle.
+
+-- Trigger when read_address is written.
+DFF_trig_read_address : entity work.d_ff 
+port map(clk  => clk,
+         rst  => rst,
+         en   => en_all,
+         data => we_regs(0), -- Delayed reg(0) write enable is used as trigger.
+         q    => trig_read_address);
+        
+-- Trigger when write_address is written.
+DFF_trig_write_address : entity work.d_ff 
+port map(clk  => clk,
+         rst  => rst,
+         en   => en_all,
+         data => we_regs(1), -- Delayed reg(1) write enable is used as trigger.
+         q    => trig_write_address);
+         
+---------------------------------
+-- Instantiate input registers --
+---------------------------------
+-- The I/O registers use scan cells.
+
+input_cell0 : entity work.scan_cell
+generic map(data_size => data_size)
+port map(clk         => clk,
+         rst         => rst,
+         en          => in_reg_en(0),
+         mode_select => scan_mode_en,
+         input       => reg_input,
+         scan_input  => scan_input_bus(data_size - 1 downto 0),
+         ID_input    => scan_input_bus(data_size),
+         output      => reg_out(0),
+         ID_output   => cell_ID_out(0));
+        
+input_cells : for J in 1 to num_in_reg - 1 generate
+    input_cells : entity work.scan_cell 
+    generic map(data_size => data_size)
+    port map(clk         => clk,
+             rst         => rst,
+             en          => in_reg_en(J),
+             mode_select => scan_mode_en,
+             input       => reg_input,
+             scan_input  => reg_out(J - 1),
+             ID_input    => cell_ID_out(J - 1),
+             output      => reg_out(J),
+             ID_output   => cell_ID_out(J));
+end generate;
+
+----------------------------------
+-- Instantiate output registers --
+----------------------------------
+output_cells : for K in num_in_reg to num_reg-1 generate
+    output_cells : entity work.scan_cell 
+    generic map(data_size => data_size)
+    port map(clk         => clk,
+             rst         => rst,
+             en          => out_reg_en(K),
+             mode_select => scan_mode_en,
+             input       => STD_LOGIC_VECTOR(result(K)),
+             scan_input  => reg_out(K-1),
+             ID_input    => cell_ID_out(K-1),
+             output      => reg_out(K),
+             ID_output   => cell_ID_out(K));
+end generate;   
+    
+--------------------------
+-- Finite State Machine --
+-------------------------- 
+
+-- Assign next_state to state at clock edge, return to idle when reset.
+state_assignment : process(clk) is
+begin
+    if rising_edge(clk) then
+        if(rst = '1') then
+            state <= idle;
+        else
+            state <= next_state;
+        end if;
+    end if;
+end process state_assignment;	
+
+-- State transition process.
+state_transitions : process(state, Miss, block_write_back, sysBus_grant_in, Modified_block, block_address,  counter_out, write_through_trig, trig_read_address, trig_write_address, Require_Main_mem, Block_in_buffer)
+
+begin
+    case state is
+        
+		when idle => 
+		    
+		    -- Check to see if the required block is in the block buffer. 
+		    if (Block_in_buffer = '1') then
+		        next_state <= buffer_block_switch;
+		    -- Next, if there is a cache miss.
+			elsif (Miss = '1') then
+				next_state <= Miss_Request;
+		    -- Next, if the block needs writing back to the memory.
+			elsif (block_write_back = '1') then	
+				next_state <= write_back_request;
+		    -- If there is a write back trigger.
+			elsif (write_through_trig = '1') then
+				next_state <= Write_through_request;
+		    -- If there is a non-main-memory and cache operation. 
+		    elsif ((trig_write_address = '1' or trig_read_address = '1') and Require_Main_mem = '0') then
+		        next_state <= Non_mem_request;
+			else
+				next_state <= state;
+			end if;
+        
+        -- State for switching the block in the buffer to one in the cache. 
+        when buffer_block_switch =>
+            if (counter_out =  block_size-1) then
+                next_state <= idle;
+            else
+                next_state <= state;
+            end if;
+        
+        -- State for requesting sysBus access for writing a block back to the main memeory.
+		when write_back_request =>
+		  
+			if (sysBus_grant_in = '1') then
+			    if (Block_in_buffer = '1') then
+                    next_state <= buffer_block_switch;
+				else
+				    next_state <= write_back_state_1;
+				end if;
+			else
+				next_state <= state;
+			end if;
+    
+        -- State for requesting sysBus access to retrieve a block from the main memory.
+		when Miss_Request => 
+			if (sysBus_grant_in = '1') then
+				if (Miss = '1' and Modified_block(to_integer(unsigned(block_address))) = '1') then 
+					next_state <= Buffer_block_placment;
+				elsif (Miss = '1' and Modified_block(to_integer(unsigned(block_address))) /= '1') then
+					next_state <= busy_1;
+				end if;
+			else
+				next_state <= state;
+			end if;
+		
+		-- State for moving a block in cache to the buffer to save it from being overwritten.
+		when Buffer_block_placment =>
+			if (counter_out = block_size-1) then	
+				next_state <= busy_1;
+			else
+				next_state <= state;
+			end if;
+	    
+	    -- First state for a memory read. 
+	    when busy_1 =>
+	       next_state <= busy_2;
+	    
+	    -- Second state for a memory read.
+	    when busy_2 => 
+	       next_state <= busy_3;
+		
+		-- Third state for a memory read.
+		when busy_3 => 
+			if ((counter_out) = block_size-1) then
+				next_state <= pass_state;
+			else
+				next_state <= state;
+			end if;
+		
+		-- Final state for a memory read.
+		when pass_state => 
+		    next_state <= idle;
+		
+		-- First state for a memory write back.
+		when write_back_state_1 =>
+		  next_state <= write_back_state_2;
+		
+		-- Second state for a memory write back.
+		when write_back_state_2 =>
+			if (unsigned(counter_out) = block_size-1) then
+				next_state <= pass_back_state;
+			else	
+				next_state <= state;
+			end if;
+		
+		-- Final state for a memory write back.
+		when pass_back_state =>
+		    next_state <= idle;
+		
+		-- State for requesting sysBus access for writing through to the main-memory.
+		when Write_through_request =>
+			if(sysBus_grant_in = '1') then
+				next_state <= write_through_state_1;
+			else
+				next_state <= state;
+			end if;
+		
+		-- First state for the write through.
+		when write_through_state_1 =>
+		    next_state <= write_through_state_2;
+		
+		-- Second state for a memory write through.
+		when write_through_state_2 => 
+			next_state <= idle;
+	   
+	    -- State for requesting sysBus access for a non-main-memory operation.
+	    when Non_mem_request =>
+	        if (sysBus_grant_in = '1') then
+	            next_state <= non_mem_busy_1;
+	        else
+	            next_state <= state;
+	        end if;
+	    
+	    -- First state for a non-mem operation.
+	    when non_mem_busy_1 =>
+	        next_state <= non_mem_busy_2;
+	    
+	    -- Second state for a non-mem operation.
+	    when non_mem_busy_2 => 
+	       next_state <= idle;
+
+
+    end case;
+end process state_transitions;
+
+-------------
+-- Counter --
+-------------
+
+-- Generic counter for moving blocks.
+buffer_tranfer : entity work.address_counter_new
+Generic Map ( limit => block_size )
+Port Map ( clk => clk,
+           rst => counter_rst,
+           en => counter_en,
+           c_out => counter_out );  
+           
+------------------------------
+-- Counter Enable and Reset -- 
+------------------------------
+
+-- Counter Enable signals.
+counter_en <= '1' when state = Buffer_block_placment or state = write_back_state_2 or state = busy_3 or state = buffer_block_switch else '0';
+counter_rst <= not counter_en;
+
+---------------------------------------
+-- FSM logic and Combinational Logic -- 
+---------------------------------------
+
+-- Trigger for the write through. This will go high when write-through operations are enabled.
+write_through_trig <= '1' when trig_write_address = '1' and Require_Main_mem = '1' and write_through = 1 and Hit = '1' else '0';
+
+-- Logic for the pause line.
+-- Pauses the processor in the Fetch Unit so no more instructions
+--  are fetched or executed while this is still working. 
+-- Whenever there is a miss, or when it is in a process that needs the fetch unit to wait.
+pause_line_int <= '1' when Miss = '1' else 
+                  '1' when state /= idle and state /= write_back_request and state /= write_back_state_1 and state /= write_back_state_2 and state /= pass_back_state else '0';
+-- Putting the pause lines internal version into the external port. 
+pause_line <= pause_line_int;
+
+-- Checking if the address sent requires the main memory. 
+-- Check if the inputted address needs the cache - Check against mem range.
+Require_Main_mem <= '1' when unsigned(reg_out(0)) >= mem_range_start and unsigned(reg_out(0)) <= mem_range_end and trig_read_address   = '1' else
+                    '1' when unsigned(reg_out(1)) >= mem_range_start and unsigned(reg_out(1)) <= mem_range_end and trig_write_address  = '1' else '0';
+
+-- The address of the currently needed block in the cache.
+-- Note: There can't be less than 2 block in the cache.
+block_address_temp <= unsigned(reg_out(0)(log2(block_size)+log2(num_blocks)-1 downto log2(block_size))) when trig_read_address = '1' else 
+                      unsigned(reg_out(1)(log2(block_size)+log2(num_blocks)-1 downto log2(block_size))) when trig_write_address = '1';
+-- Once the value for the number of blocks is attained,
+--  this statment ensures, for off values of blocks, there isn't an out-of-range error.                      
+block_address <= block_address_temp when to_integer(block_address_temp) < num_blocks else
+                 block_address_temp-1 when to_integer(block_address_temp) = num_blocks;    
+
+----------------------------
+-- Modified block signals --
+----------------------------
+
+-- When the block is written to, then the modified bit for that block goes high.
+-- When the same block is referenced in the busy state then it has been written over,
+--  so the modified block signal goes low.
+Modified_block(to_integer(block_address)) <= '1' when Hit = '1' and trig_write_address = '1' and write_through = 0 else
+                                             buffer_modified_bit_temp when state = buffer_block_switch and counter_out = 3 else
+                                             '0' when state = busy_3;
+-- This signal takes the modified bit of the block when it is moved to the buffer.
+buffer_modified_bit <= Modified_block(to_integer(block_address)) when state = Buffer_block_placment else
+                       Modified_block(to_integer(block_address)) when state = buffer_block_switch and counter_out = 2 else
+                       '0' when state = write_back_state_2; 
+-- This signal allows for the above two signals to switch when there is a buffer block switch.
+buffer_modified_bit_temp <= buffer_modified_bit when state = buffer_block_switch and counter_out = 1;
+
+
+----------------------------------
+-- Write back and through logic --
+---------------------------------- 
+
+-- This is the trigger for when the block in the buffer needs to be written back to the main-memory.
+block_write_back <= buffer_modified_bit when state /= write_back_state_2 else
+                    '0' when state = write_back_state_2;
+
+-- Block in buffer signal. 
+-- This goes high when the required block, from a request, is in the block buffer.
+Block_in_buffer <= '1' when Tag_buffer_out = reg_out(0)(data_size-1 downto log2(block_size)) and trig_read_address   = '1' else
+                   '1' when Tag_buffer_out = reg_out(1)(data_size-1 downto log2(block_size)) and trig_write_address  = '1' else '0';
+                   
+------------------------                   
+-- Hit and Miss Logic --
+------------------------ 	
+	
+-- Logic for the cache hit! 
+Hit <= '1' when trig_read_address   = '1' and reg_out(0)(data_size-1 downto log2(block_size)) = (Tag_out) else
+       '1' when trig_write_address  = '1' and reg_out(1)(data_size-1 downto log2(block_size)) = (Tag_out) else 
+       '0';
+-- Logic for a cache miss!       
+Miss <= '1' when trig_read_address   = '1' and reg_out(0)(data_size-1 downto log2(block_size)) /= (Tag_out) and Require_Main_mem = '1' else 
+        '1' when trig_write_address  = '1' and reg_out(1)(data_size-1 downto log2(block_size)) /= (Tag_out) and Require_Main_mem = '1' else
+        '0';
+
+--------------------------------
+-- Cache RAM addressing logic -- 
+--------------------------------
+
+-- Cache Data RAM -- 
+
+-- Read address for the data cache RAM.	
+Cache_Raddress <= counter_out when (state = Buffer_block_placment or state = buffer_block_switch) else
+                  unsigned(reg_out(0)(log2(block_size)-1 downto 0)) when Hit = '1' and (state /= Buffer_block_placment or state /= buffer_block_switch) else
+                  (others => 'U');
+
+-- Allow the cache to be written to when there is a write instr or when there is a block read from mem.
+Cache_wen <= '1' when Hit = '1' and trig_write_address = '1' else
+             '1' when state = busy_3 else
+             '1' when state = buffer_block_switch else '0';
+             
+-- The address either is from the registers or the counter that is from the memory.
+Cache_Waddress <= unsigned(reg_out(1)(log2(block_size)-1 downto 0)) when state = idle else
+                  (counter_out) when (state = busy_3 or state = buffer_block_switch) else (others => 'U');
+                 
+-- Similarly the data in is either from the data_in reg or from the memory from a miss read. 
+Cache_data_in <= reg_out(2) when state = idle else
+                 std_logic_vector(sysBus_data) when state = busy_3 else
+                 Block_buffer_out when state = buffer_block_switch; 
+                                           
+-- Put data from the sysBus into the dataOut register when a read is triggered and this unit has control of the bus, else do not change.
+result(3) <=  unsigned(cache_data_out) when Hit = '1' and trig_read_address = '1' else
+              unsigned(sysBus_data) when state = busy_3 else
+              UNSIGNED(sysBus_data) when state = non_mem_busy_2 and sysBus_control_internal = "00" else result(3);
+
+-- Cache Tag RAM -- 
+
+Tag_wen <= '1' when unsigned(counter_out) = 1 and (state = busy_3 or state = buffer_block_switch) else '0';
+Tag_Waddress <= (block_address);
+Tag_Raddress <= (block_address);
+Tag_in <= Tag_buffer_out when state = buffer_block_switch else
+          std_logic_vector(reg_out(0)(data_size-1  downto log2(block_size))) when trig_read_address  = '1' else
+          std_logic_vector(reg_out(1)(data_size-1 downto log2(block_size)))  when trig_write_address = '1';
+          
+-- Cache Block Buffer RAM -- 
+
+-- Logic for the buffer when there is a block clash.
+Block_buffer_wen <= '1' when (state = Buffer_block_placment or state = buffer_block_switch) else '0';
+Block_buffer_Waddress <= counter_out;
+Block_buffer_Raddress <= counter_out;
+Block_buffer_in <= cache_data_out;
+
+-- Cache Tag Buffer RAM -- 
+
+Tag_buffer_wen <= '1' when (state = Buffer_block_placment or state = buffer_block_switch) and counter_out = 1 else
+                  '1' when state = pass_back_state else '0';
+Tag_buffer_Waddress <= (others => '0');
+Tag_buffer_Raddress <= (others => '0');
+Tag_buffer_in <= Tag_Out when (state = Buffer_block_placment or state = buffer_block_switch) else
+                 (others => 'U') when state = write_back_state_2;
+                 
+------------------
+-- SysBus Logic --
+------------------ 
+
+-- Signals to help with keeping this area a little more tidy.
+Busy_sig <= '1' when state = busy_1 or state = busy_2 or state = busy_3 else '0';
+write_back_busy <= '1' when state = write_back_state_1 or state = write_back_state_2 else '0';
+
+-- Output the relevent address onto the sysBus when a read or write is occuring and this unit has control of the bus, else HiZ.
+sysBus_address <= (reg_out(0)) when Busy_sig = '1' and trig_read_address  = '1' and sysBus_control_internal = "01" else
+                  (reg_out(1)) when Busy_sig = '1' and trig_write_address = '1' and sysBus_control_internal = "01" else
+                  -- Value for the write back address.
+                  (Tag_buffer_out) & std_logic_vector(counter_out) when write_back_busy = '1' and sysBus_control_internal = "10" else
+                  -- Value for the write through address.
+                  (reg_out(1)) when state = write_through_state_2 and sysBus_control_internal = "11" else
+                  -- Non mem operations.
+                  (reg_out(0)) when state = non_mem_busy_2 and sysBus_control_internal = "00" else 
+                  (reg_out(1)) when state = non_mem_busy_2 and sysBus_control_internal = "11" else 
+                  (others => 'Z');
+
+-- "00" signale read, "11", single write, "01" block read, "10" block write.
+sysBus_control_internal <= "01" when Require_Main_mem = '1' and Busy_sig = '1' else
+                           "10" when state = write_back_state_1 or state = write_back_state_2  else
+                           "11" when state = write_through_state_1 or state = write_through_state_2 or state = Write_through_request else
+                           "00" when (state = non_mem_request or state = non_mem_busy_1 or state = non_mem_busy_2) and non_mem_operation = '0' else
+                           "11" when (state = non_mem_request or state = non_mem_busy_1 or state = non_mem_busy_2) and non_mem_operation = '1' else
+                           (others => 'Z');
+-- Internal conrtol signal is output when this unit has control of the bus, else HiZ.
+sysBus_control <= sysBus_control_internal;	
+
+non_mem_operation <= '1' when trig_write_address = '1' else
+                     '0' when trig_read_address = '1';
+
+-- Put the inputted data onto the sysBus when a write is triggered and this unit has control of the bus, else HiZ.           
+sysBus_data <= (reg_out(2)) when state = non_mem_busy_2 and sysBus_control_internal = "11" else 
+               (reg_out(2)) when state = write_through_state_2 and sysBus_control_internal = "11" else
+               (block_buffer_out) when state = write_back_state_2 and sysBus_control_internal = "10" else
+               (others => 'Z');
+
+-- Internal request is '1' when in request state, '0' otherwise.
+sysBus_request_internal <= '1' when state = Miss_Request or state = Write_through_request or state = Non_mem_request or state = write_back_request else '0';
+-- The request is only outputted when in request state, else HiZ.
+sysBus_request <= sysBus_request_internal when state = Miss_Request or state = Write_through_request or state = Non_mem_request or state = write_back_request else 'Z';
+-- The grant token is passed along when recieved and this unit is not requesting access.
+sysBus_grant_out <= sysBus_grant_in and (not sysBus_request_internal);
+-- Hold the busy line high while this unit has control, HiZ otherwise.
+sysBus_busy <= '1' when state /= idle and state /= Miss_Request and state /= Write_through_request and state /= Non_mem_request and state /= write_back_request else 'Z';
+
+----------------------------
+-- Signals for scan chain --
+----------------------------
+
+scan_output_bus(data_size)              <= cell_ID_out(num_reg - 1);
+scan_output_bus(data_size - 1 downto 0) <= reg_out(num_reg - 1); 
+
+-----------------------------------------------------------------------------------------
+-- Tri-state buffers on the outputs of the registers to properly connect to the FU Bus -- 
+-----------------------------------------------------------------------------------------
+
+connections2: for M in num_in_reg to num_reg-1 generate
+    reg_output <= reg_out(M) when re_regs(M) = '1' else (others => 'Z');
+end generate;    
+
+---------------
+-- Tag Cache --
+---------------
+
+Data_Cache_Tag_RAM : entity work.Tag_RAM
+Generic Map ( num_blocks => num_blocks,
+              block_size => block_size,
+              data_size => data_size )
+Port Map ( clk => clk,
+           wen => Tag_wen,
+           Waddress => Tag_Waddress,
+           Raddress => Tag_Raddress,
+           Data_in => Tag_in,
+           Data_out => Tag_out );      
+
+---------------------------
+-- RAM for the Cache mem --
+--------------------------- 
+
+Data_Cache_RAM : entity work.cache_mem
+Generic Map (  block_size => block_size, 
+               instr_size  => data_size, 
+               num_blocks => num_blocks )
+Port Map  ( clk => clk,
+            wen => Cache_wen,
+            block_address => unsigned(block_address),
+            Waddress => Cache_Waddress,
+            Raddress => Cache_Raddress,
+            instr_in => cache_data_in,
+            instr_out => cache_data_out );
+            
+----------------
+-- Tag Buffer --
+----------------
+
+tag_buffer_RAM : entity work.Tag_RAM
+Generic Map (block_size => block_size,
+             data_size => data_size, 
+             num_blocks => 1)
+Port Map  ( clk => clk,
+            wen => Tag_buffer_wen,
+            Waddress => (others => '0'),
+            Raddress => (others => '0'),
+            data_in => Tag_buffer_in,
+            data_out => Tag_buffer_out );
+
+------------------
+-- Block Buffer --
+------------------
+
+block_buffer_RAM : entity work.cache_mem
+Generic Map (block_size => block_size,
+             instr_size => data_size,
+			 num_blocks => 1)
+Port Map  ( clk => clk,
+            wen => Block_buffer_wen,
+            block_address => (others => '0'),
+            Waddress => Block_buffer_Waddress,
+            Raddress => Block_buffer_Raddress,
+            instr_in => Block_buffer_in,
+            instr_out => Block_buffer_out ); 
+    
+end Behavioral;
