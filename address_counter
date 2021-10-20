@@ -1,0 +1,53 @@
+-------------------------------------------------------------------------------------------------------
+-- Company: University Of York                                                                       --
+-- Engineer: Will Kirby                                                                              --
+-- Module Name: address_counter_new                                                                  --
+-- Project Name: Cache Implementation for the Simple MOVE Processor                                  --
+-- Tool versions: Vivado 2017.4                                                                      --
+-- Description: Up-Counter used for the addresses in the caches.                                     --
+-------------------------------------------------------------------------------------------------------
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+use work.DigEng.all;
+
+entity address_counter_new is
+Generic ( limit : integer := 16 );
+Port(
+    clk : in std_logic;
+    rst : in std_logic;
+    en : in std_logic;
+    c_out : out unsigned(log2(limit)-1 downto 0)
+    );
+end address_counter_new;
+
+architecture Behavioral of address_counter_new is
+
+-- Internal Counter value signal.
+signal count_int : unsigned(log2(limit)-1 downto 0);
+
+begin
+
+-- Process for counting up with the clock edges, with reset and LIMIT.
+counter_process : process (clk) is 
+begin
+    if rising_edge(clk) then
+        if rst = '1' then
+            count_int <= (others => '0');
+        else
+            if en = '1' then
+                if count_int = limit-1 then
+                    count_int <= (others => '0');
+                else
+                    count_int <= (count_int + 1);
+                end if;
+            end if;
+        end if;
+    end if;
+end process counter_process;
+
+-- Pushing the internal counter value to the output.
+c_out <= (count_int);
+
+end Behavioral;
